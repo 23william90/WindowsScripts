@@ -1,0 +1,106 @@
+# 1. Create a dedicated directory for the script
+$scriptDir = "C:\ProgramData\Scripts"
+if (-not (Test-Path $scriptDir)) {
+    New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
+}
+
+# 2. Write the 3-button interactive blocker script
+$vbsContent = @'
+Option Explicit
+Dim objShell, res, confirmRes, ifeoKey, debuggerVal, i, args, targetExe, fso
+
+Set objShell = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+
+ifeoKey = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\msedge.exe\"
+debuggerVal = "wscript.exe """ & WScript.ScriptFullName & """"
+
+' 307 = 3 (Yes/No/Cancel) + 48 (Warning icon) + 256 (Default Button 2: No)
+Dim promptMsg
+promptMsg = "Microsoft Edge is disabled on this computer." & vbCrLf & vbCrLf & _
+            "• [Yes]  - Launch Edge this one time" & vbCrLf & _
+            "• [No]   - Keep Edge blocked (Close)" & vbCrLf & _
+            "• [Cancel] - Permanently remove this blocker"
+
+res = MsgBox(promptMsg, 307, "System Notice")
+
+Select Case res
+    Case 6 ' --- YES: Launch Edge once and auto-relock ---
+        ' Temporarily lift the interceptor
+        On Error Resume Next
+        objShell.RegDelete ifeoKey & "Debugger"
+        On Error GoTo 0
+
+        ' Forward original URL / parameters passed to Edge
+        If WScript.Arguments.Count > 0 Then
+            targetExe = WScript.Arguments(0)
+            args = ""
+            For i = 1 To WScript.Arguments.Count - 1
+                args = args & " " & Chr(34) & WScript.Arguments(i) & Chr(34)
+            Next
+        Else
+            targetExe = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+            args = ""
+        End If
+
+        If Not fso.FileExists(targetExe) Then
+            If fso.FileExists("C:\Program Files\Microsoft\Edge\Application\msedge.exe") Then
+                targetExe = "C:\Program Files\Microsoft\Edge\Application\msedge.exe"
+            End If
+        End If
+
+        ' Run Edge synchronously (waits for all windows to close)
+        objShell.Run Chr(34) & targetExe & Chr(34) & args, 1, True
+
+        ' Re-lock Edge once closed
+        objShell.RegWrite ifeoKey & "Debugger", debuggerVal, "REG_SZ"
+        WScript.Quit
+
+    Case 7 ' --- NO: Keep blocked and exit ---
+        WScript.Quit
+
+    Case 2 ' --- CANCEL: Remove modification ---
+        ' 308 = 4 (Yes/No) + 48 (Warning icon) + 256 (Default Button 2: No)
+        confirmRes = MsgBox("Are you sure you want to permanently remove the Edge blocker and restore standard Edge behavior?", 308, "Confirm Removal")
+        
+        If confirmRes = 6 Then
+            ' Delete the registry hook permanently
+            On Error Resume Next
+            objShell.RegDelete ifeoKey & "Debugger"
+            On Error GoTo 0
+            
+            MsgBox "The Edge blocker has been permanently removed. Microsoft Edge will now open normally.", 64, "Blocker Removed"
+            
+            ' Self-delete the script file
+            objShell.Run "cmd.exe /c timeout /t 1 /nobreak >nul & del """ & WScript.ScriptFullName & """", 0, False
+        End If
+        WScript.Quit
+End Select
+'@
+
+$vbsPath = "$scriptDir\edge_blocker.vbs"
+Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII
+
+# 3. Configure IFEO registry hook
+$ifeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\msedge.exe"
+if (-not (Test-Path $ifeoPath)) {
+    New-Item -Path $ifeoPath -Force | Out-Null
+}
+Set-ItemProperty -Path $ifeoPath -Name "Debugger" -Value "wscript.exe `"$vbsPath`"" -Type String
+
+# 4. Grant standard users write access to this key so it can self-delete/toggle without UAC prompts
+$acl = Get-Acl $ifeoPath
+$userGroup = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-545") # Builtin Users SID
+$rule = New-Object System.Security.AccessControl.RegistryAccessRule($userGroup, "FullControl", "Allow")
+$acl.AddAccessRule($rule)
+Set-Acl -Path $ifeoPath -AclObject $acl
+
+# 5. Disable Edge background startup/pre-warming
+$policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
+if (-not (Test-Path $policyPath)) {
+    New-Item -Path $policyPath -Force | Out-Null
+}
+Set-ItemProperty -Path $policyPath -Name "StartupBoostEnabled" -Value 0 -Type DWord
+Set-ItemProperty -Path $policyPath -Name "BackgroundModeEnabled" -Value 0 -Type DWord
+
+Write-Host "Edge blocker updated with built-in uninstaller button." -ForegroundColor Green
