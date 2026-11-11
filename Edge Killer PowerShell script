@@ -1,13 +1,14 @@
-# 1. Create a dedicated directory for the script
+# 1. Ensure target directory exists
 $scriptDir = "C:\ProgramData\Scripts"
 if (-not (Test-Path $scriptDir)) {
     New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
 }
 
-# 2. Write the 3-button interactive blocker script
+# 2. Write the hybrid Router + Interceptor script with Bing-to-Google rewriting
 $vbsContent = @'
 Option Explicit
-Dim objShell, res, confirmRes, ifeoKey, debuggerVal, i, args, targetExe, fso
+Dim objShell, fso, ifeoKey, debuggerVal, chromeExe, i, rawArg, cleanUrl, finalArgs
+Dim res, confirmRes, targetExe, args, promptMsg
 
 Set objShell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -15,23 +16,121 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 ifeoKey = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\msedge.exe\"
 debuggerVal = "wscript.exe """ & WScript.ScriptFullName & """"
 
+' Locate Google Chrome
+chromeExe = ""
+If fso.FileExists("C:\Program Files\Google\Chrome\Application\chrome.exe") Then
+    chromeExe = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+ElseIf fso.FileExists("C:\Program Files (x86)\Google\Chrome\Application\chrome.exe") Then
+    chromeExe = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+ElseIf fso.FileExists(objShell.ExpandEnvironmentStrings("%LocalAppData%\Google\Chrome\Application\chrome.exe")) Then
+    chromeExe = objShell.ExpandEnvironmentStrings("%LocalAppData%\Google\Chrome\Application\chrome.exe")
+End If
+
+finalArgs = ""
+
+' Helper function to rewrite Bing search URLs to Google searches
+Function ConvertBingToGoogle(ByVal url)
+    Dim qIndex, queryPart, ampIndex, searchTerms
+    
+    If InStr(1, url, "bing.com/search", 1) > 0 Then
+        qIndex = InStr(1, url, "q=", 1)
+        If qIndex > 0 Then
+            queryPart = Mid(url, qIndex + 2)
+            ampIndex = InStr(queryPart, "&")
+            If ampIndex > 0 Then
+                searchTerms = Left(queryPart, ampIndex - 1)
+            Else
+                searchTerms = queryPart
+            End If
+            ConvertBingToGoogle = "https://www.google.com/search?q=" & searchTerms
+            Exit Function
+        End If
+    End If
+    ConvertBingToGoogle = url
+End Function
+
+' -------------------------------------------------------------
+' Step A: Parse arguments to detect valid URLs or search queries
+' -------------------------------------------------------------
+' In IFEO, WScript.Arguments(0) is the path to msedge.exe
+If WScript.Arguments.Count > 1 Then
+    For i = 1 To WScript.Arguments.Count - 1
+        rawArg = WScript.Arguments(i)
+
+        ' Ignore Edge internal diagnostic/process/sandbox arguments
+        If InStr(1, rawArg, "--type=", 1) = 0 And _
+           InStr(1, rawArg, "--profile-directory=", 1) = 0 And _
+           InStr(1, rawArg, "--service-sandbox-type=", 1) = 0 And _
+           InStr(1, rawArg, "--mojo-platform-channel-handle=", 1) = 0 Then
+
+            cleanUrl = rawArg
+
+            ' Strip 'microsoft-edge:' or 'microsoft-edge:?' prefixes
+            If LCase(Left(cleanUrl, 16)) = "microsoft-edge:?" Then
+                cleanUrl = Mid(cleanUrl, 17)
+            ElseIf LCase(Left(cleanUrl, 15)) = "microsoft-edge:" Then
+                cleanUrl = Mid(cleanUrl, 16)
+            End If
+
+            ' If the parameter contains an embedded url= target, isolate it
+            If InStr(1, cleanUrl, "url=", 1) > 0 Then
+                Dim parts
+                parts = Split(cleanUrl, "url=")
+                If UBound(parts) >= 1 Then
+                    cleanUrl = parts(1)
+                    If InStr(cleanUrl, "&") > 0 Then
+                        cleanUrl = Left(cleanUrl, InStr(cleanUrl, "&") - 1)
+                    End If
+                    cleanUrl = Replace(cleanUrl, "%3A", ":")
+                    cleanUrl = Replace(cleanUrl, "%2F", "/")
+                    cleanUrl = Replace(cleanUrl, "%3F", "?")
+                    cleanUrl = Replace(cleanUrl, "%3D", "=")
+                    cleanUrl = Replace(cleanUrl, "%26", "&")
+                    cleanUrl = Replace(cleanUrl, "%25", "%")
+                End If
+            End If
+
+            ' Convert Bing search links to Google search links
+            cleanUrl = ConvertBingToGoogle(cleanUrl)
+
+            ' Check if parameter represents a URL or web address
+            If LCase(Left(cleanUrl, 7)) = "http://" Or _
+               LCase(Left(cleanUrl, 8)) = "https://" Or _
+               LCase(Left(cleanUrl, 7)) = "file://" Or _
+               InStr(cleanUrl, "://") > 0 Or _
+               InStr(cleanUrl, ".") > 0 Then
+                finalArgs = finalArgs & " " & Chr(34) & cleanUrl & Chr(34)
+            End If
+        End If
+    Next
+End If
+
+' -------------------------------------------------------------
+' Step B: Branch depending on whether a destination was found
+' -------------------------------------------------------------
+If Trim(finalArgs) <> "" And chromeExe <> "" Then
+    ' ROUTE DIRECTLY: Valid URL passed, open in Chrome
+    objShell.Run Chr(34) & chromeExe & Chr(34) & finalArgs, 1, False
+    WScript.Quit
+End If
+
+' -------------------------------------------------------------
+' Step C: Fallback interactive prompt (No URL or manual launch)
+' -------------------------------------------------------------
 ' 307 = 3 (Yes/No/Cancel) + 48 (Warning icon) + 256 (Default Button 2: No)
-Dim promptMsg
 promptMsg = "Microsoft Edge is disabled on this computer." & vbCrLf & vbCrLf & _
-            "• [Yes]  - Launch Edge this one time" & vbCrLf & _
-            "• [No]   - Keep Edge blocked (Close)" & vbCrLf & _
+            "• [Yes]    - Launch Edge this one time" & vbCrLf & _
+            "• [No]     - Keep Edge blocked (Close)" & vbCrLf & _
             "• [Cancel] - Permanently remove this blocker"
 
 res = MsgBox(promptMsg, 307, "System Notice")
 
 Select Case res
     Case 6 ' --- YES: Launch Edge once and auto-relock ---
-        ' Temporarily lift the interceptor
         On Error Resume Next
         objShell.RegDelete ifeoKey & "Debugger"
         On Error GoTo 0
 
-        ' Forward original URL / parameters passed to Edge
         If WScript.Arguments.Count > 0 Then
             targetExe = WScript.Arguments(0)
             args = ""
@@ -49,7 +148,7 @@ Select Case res
             End If
         End If
 
-        ' Run Edge synchronously (waits for all windows to close)
+        ' Run Edge synchronously (waits until all Edge windows close)
         objShell.Run Chr(34) & targetExe & Chr(34) & args, 1, True
 
         ' Re-lock Edge once closed
@@ -59,12 +158,11 @@ Select Case res
     Case 7 ' --- NO: Keep blocked and exit ---
         WScript.Quit
 
-    Case 2 ' --- CANCEL: Remove modification ---
+    Case 2 ' --- CANCEL: Remove modification permanently ---
         ' 308 = 4 (Yes/No) + 48 (Warning icon) + 256 (Default Button 2: No)
         confirmRes = MsgBox("Are you sure you want to permanently remove the Edge blocker and restore standard Edge behavior?", 308, "Confirm Removal")
         
         If confirmRes = 6 Then
-            ' Delete the registry hook permanently
             On Error Resume Next
             objShell.RegDelete ifeoKey & "Debugger"
             On Error GoTo 0
@@ -88,7 +186,7 @@ if (-not (Test-Path $ifeoPath)) {
 }
 Set-ItemProperty -Path $ifeoPath -Name "Debugger" -Value "wscript.exe `"$vbsPath`"" -Type String
 
-# 4. Grant standard users write access to this key so it can self-delete/toggle without UAC prompts
+# 4. Grant standard users write access to this key so temporary bypass and uninstall work without UAC prompts
 $acl = Get-Acl $ifeoPath
 $userGroup = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-545") # Builtin Users SID
 $rule = New-Object System.Security.AccessControl.RegistryAccessRule($userGroup, "FullControl", "Allow")
@@ -103,4 +201,4 @@ if (-not (Test-Path $policyPath)) {
 Set-ItemProperty -Path $policyPath -Name "StartupBoostEnabled" -Value 0 -Type DWord
 Set-ItemProperty -Path $policyPath -Name "BackgroundModeEnabled" -Value 0 -Type DWord
 
-Write-Host "Edge blocker updated with built-in uninstaller button." -ForegroundColor Green
+Write-Host "Updated script applied: Windows Search & Edge links redirect to Chrome, Bing queries are rewritten to Google, and manual opens trigger the dialog." -ForegroundColor Green
